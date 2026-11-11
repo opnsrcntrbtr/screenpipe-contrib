@@ -723,7 +723,9 @@ pub async fn start_monitor_watcher(
                         warn!("failed to stop vision manager for DRM pause: {:?}", e);
                     }
                     if let Some(ref am) = audio_manager {
-                        if let Err(e) = am.stop_output_devices().await {
+                        if drm_detector::keep_audio_during_drm() {
+                            info!("DRM pause: keeping audio capture running (SCREENPIPE_DRM_KEEP_AUDIO)");
+                        } else if let Err(e) = am.stop_output_devices().await {
                             warn!("failed to stop SCK audio for DRM pause: {:?}", e);
                         }
                     }
@@ -747,8 +749,10 @@ pub async fn start_monitor_watcher(
                     warn!("failed to restart vision manager after DRM pause: {:?}", e);
                 }
                 if let Some(ref am) = audio_manager {
-                    if let Err(e) = am.start_output_devices().await {
-                        warn!("failed to restart SCK audio after DRM clear: {:?}", e);
+                    if !drm_detector::keep_audio_during_drm() {
+                        if let Err(e) = am.start_output_devices().await {
+                            warn!("failed to restart SCK audio after DRM clear: {:?}", e);
+                        }
                     }
                 }
                 drm_stopped = false;
@@ -1261,6 +1265,9 @@ pub async fn start_monitor_watcher(
                 let notify = crate::sleep_monitor::display_reconfig_notify();
                 tokio::select! {
                     _ = notify.notified() => {}
+                    // Release/restore ScreenCaptureKit as soon as the DRM state flips,
+                    // not at the next backstop (up to 60 s of blacked-out video).
+                    _ = drm_detector::drm_transition_notify().notified() => {}
                     _ = tokio::time::sleep(backstop) => {}
                 }
             }

@@ -26,6 +26,7 @@
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 #[cfg(target_os = "macos")]
 use tracing::warn;
 use tracing::{debug, info};
@@ -60,9 +61,21 @@ pub fn drm_content_paused() -> bool {
     DRM_CONTENT_PAUSED.load(Ordering::SeqCst)
 }
 
+/// Woken on every pause/resume transition. The monitor watcher otherwise sleeps
+/// up to its 60 s backstop, and until it runs the ScreenCaptureKit streams stay
+/// open — protected video stays black although the pause flag is already set.
+static DRM_TRANSITION: Lazy<Notify> = Lazy::new(Notify::new);
+
+pub fn drm_transition_notify() -> &'static Notify {
+    &DRM_TRANSITION
+}
+
 /// Set the DRM pause state. Logs transitions.
 pub fn set_drm_paused(paused: bool) {
     let was_paused = DRM_CONTENT_PAUSED.swap(paused, Ordering::SeqCst);
+    if paused != was_paused {
+        DRM_TRANSITION.notify_one();
+    }
     if paused && !was_paused {
         info!("DRM content detected — pausing screen capture");
     } else if !paused && was_paused {
@@ -128,8 +141,53 @@ const DRM_DOMAINS: &[&str] = &[
 /// URL path patterns for streaming services on generic domains.
 const DRM_URL_PATHS: &[(&str, &str)] = &[("amazon.com", "/gp/video/")];
 
+/// Extra DRM URL patterns from `SCREENPIPE_DRM_URLS`: comma-separated `host` or
+/// `host/path-prefix` entries (scheme and `www.` optional), e.g.
+/// `example.edu/course/player`. For sites that play Widevine/PlayReady
+/// video in the browser (course players, internal video portals) and so go
+/// black while ScreenCaptureKit is capturing — the list above only knows the
+/// big streaming services.
+static EXTRA_DRM_URLS: Lazy<Vec<(String, String)>> =
+    Lazy::new(|| parse_extra_drm_urls(&std::env::var("SCREENPIPE_DRM_URLS").unwrap_or_default()));
+
+fn parse_extra_drm_urls(spec: &str) -> Vec<(String, String)> {
+    spec.split(',')
+        .filter_map(|raw| {
+            let lower = raw.trim().to_lowercase();
+            let p = lower
+                .strip_prefix("https://")
+                .or_else(|| lower.strip_prefix("http://"))
+                .unwrap_or(&lower);
+            let p = p.strip_prefix("www.").unwrap_or(p);
+            if p.is_empty() {
+                return None;
+            }
+            let (host, path) = match p.find('/') {
+                Some(i) => (&p[..i], &p[i..]),
+                None => (p, ""),
+            };
+            Some((host.to_string(), path.to_string()))
+        })
+        .collect()
+}
+
+/// Keep audio (including ScreenCaptureKit system audio) running while DRM
+/// content pauses screen capture: `SCREENPIPE_DRM_KEEP_AUDIO=1`. On macOS only
+/// screen-pixel capture blanks protected video; audio capture does not, and a
+/// lecture's audio is the part worth keeping.
+pub fn keep_audio_during_drm() -> bool {
+    matches!(
+        std::env::var("SCREENPIPE_DRM_KEEP_AUDIO").map(|v| v.to_lowercase()).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
 /// Check whether `url` points to a known DRM streaming site.
 pub fn is_drm_url(url: &str) -> bool {
+    is_drm_url_with(url, &EXTRA_DRM_URLS)
+}
+
+fn is_drm_url_with(url: &str, extra: &[(String, String)]) -> bool {
     let lower = url.to_lowercase();
     let host_and_path = lower
         .strip_prefix("https://")
@@ -154,7 +212,14 @@ pub fn is_drm_url(url: &str) -> bool {
             }
         }
     }
-    false
+    let url_path = &normalized[host.len()..];
+    extra.iter().any(|(domain, path)| {
+        let host_ok = host == domain
+            || host
+                .strip_suffix(domain.as_str())
+                .is_some_and(|s| s.ends_with('.'));
+        host_ok && url_path.starts_with(path.as_str())
+    })
 }
 
 /// Combined check: is the foreground content DRM-protected?
@@ -368,6 +433,11 @@ pub fn pre_capture_drm_check(pause_on_drm_content: bool, trigger_app_name: Optio
                     }
                 }
             }
+            if extra_drm_browser_window_on_screen() {
+                info!("pre-capture DRM check: trigger '{}', but a configured DRM page is visible — blocking", app);
+                set_drm_paused(true);
+                return true;
+            }
             return false;
         }
 
@@ -377,6 +447,14 @@ pub fn pre_capture_drm_check(pause_on_drm_content: bool, trigger_app_name: Optio
                 info!(
                     "pre-capture DRM check: focused app='{}', url={:?} — blocking",
                     app_name, url
+                );
+                set_drm_paused(true);
+                return true;
+            }
+            if extra_drm_browser_window_on_screen() {
+                info!(
+                    "pre-capture DRM check: focused app='{}', but a configured DRM page is visible — blocking",
+                    app_name
                 );
                 set_drm_paused(true);
                 return true;
@@ -402,6 +480,80 @@ pub fn pre_capture_drm_check(pause_on_drm_content: bool, trigger_app_name: Optio
 
 #[cfg(not(target_os = "macos"))]
 pub fn pre_capture_drm_check(_pause_on_drm_content: bool, _trigger_app_name: Option<&str>) -> bool {
+    false
+}
+
+/// Is any on-screen browser window showing a `SCREENPIPE_DRM_URLS` page?
+///
+/// The built-in list can be matched from window titles; configured pages often
+/// can't (a course portal's player title is often just the site name), so read each on-screen browser's window URLs over Accessibility.
+/// Without this, focusing any other app (even the app that started capture) resumes capture
+/// while the lecture is still visible, and the video goes black again.
+#[cfg(target_os = "macos")]
+fn extra_drm_browser_window_on_screen() -> bool {
+    use cidre::{ax, cf, cg};
+    if EXTRA_DRM_URLS.is_empty() {
+        return false;
+    }
+    let Some(windows) = cg::WindowList::info(cg::WindowListOpt::ON_SCREEN_ONLY, cg::WINDOW_ID_NULL) else {
+        return false;
+    };
+    let (key_owner, key_pid, key_layer) =
+        (cg::window_keys::owner_name(), cg::window_keys::owner_pid(), cg::window_keys::layer());
+    let mut checked: Vec<i32> = Vec::new();
+    for i in 0..windows.len() {
+        let dict = &windows[i];
+        let layer0 = dict
+            .get(key_layer)
+            .and_then(|v| v.try_as_number())
+            .and_then(|n| n.to_i32())
+            .map_or(true, |l| l == 0);
+        if !layer0 {
+            continue;
+        }
+        let owner = match dict.get(key_owner).and_then(|v| v.try_as_string()) {
+            Some(o) => o.to_string(),
+            None => continue,
+        };
+        if !is_browser(&owner) {
+            continue;
+        }
+        let pid = match dict.get(key_pid).and_then(|v| v.try_as_number()).and_then(|n| n.to_i32()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if checked.contains(&pid) {
+            continue;
+        }
+        checked.push(pid);
+        let hit = cidre::objc::ar_pool(|| -> bool {
+            let app = ax::UiElement::with_app_pid(pid);
+            let _ = app.set_messaging_timeout_secs(0.3);
+            let Ok(children) = app.children() else { return false };
+            for j in 0..children.len() {
+                let w = &children[j];
+                let _ = w.set_messaging_timeout_secs(0.2);
+                if let Ok(val) = w.attr_value(ax::attr::document()) {
+                    if val.get_type_id() == cf::String::type_id() {
+                        let url: &cf::String = unsafe { std::mem::transmute(&*val) };
+                        if is_drm_url(&url.to_string()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        });
+        if hit {
+            debug!("configured DRM page visible in '{}' (pid {})", owner, pid);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn extra_drm_browser_window_on_screen() -> bool {
     false
 }
 
@@ -514,7 +666,7 @@ pub fn poll_drm_clear() -> bool {
             // Focused app is not DRM — but a DRM window may still be visible
             // on another monitor. macOS DRM blacks out content when SCK is
             // active on ANY display, so we must stay paused.
-            if any_drm_window_on_screen() {
+            if any_drm_window_on_screen() || extra_drm_browser_window_on_screen() {
                 debug!(
                     "focused app '{}' is not DRM, but a DRM window is still visible — keeping pause",
                     app_name
@@ -706,6 +858,25 @@ mod tests {
             "https://apps.disneyplus.com/il/shows/scrubs/123/watch"
         ));
         assert!(is_drm_url("https://watch.hulu.com/show/abc"));
+    }
+
+    #[test]
+    fn test_extra_drm_urls_host_and_path() {
+        let extra = parse_extra_drm_urls(" https://www.example.edu/course/player , videos.example.org ,, ");
+        assert_eq!(extra.len(), 2);
+        let player = "https://www.example.edu/course/player/unit1/abc123/def456";
+        assert!(is_drm_url_with(player, &extra));
+        assert!(is_drm_url_with("https://learn.example.edu/course/player/x", &extra));
+        // same site, other pages: keep capturing
+        assert!(!is_drm_url_with("https://www.example.edu/course/dashboard", &extra));
+        assert!(!is_drm_url_with("https://example.edu/", &extra));
+        // host-only entry covers every path; lookalike hosts don't match
+        assert!(is_drm_url_with("https://videos.example.org/watch/1", &extra));
+        assert!(!is_drm_url_with("https://videos.example.org.evil.com/watch/1", &extra));
+        assert!(!is_drm_url_with("https://notvideos.example.org/", &extra));
+        // no extras: behaviour unchanged
+        assert!(!is_drm_url_with(player, &[]));
+        assert!(is_drm_url_with("https://www.netflix.com/watch/1", &[]));
     }
 
     #[test]

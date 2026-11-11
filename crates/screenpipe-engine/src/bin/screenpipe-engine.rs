@@ -2007,7 +2007,10 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
             // If DRM content was already focused at launch, the DRM callback
             // fired before audio was ready. Stop the output device now so we
             // don't hold an SCK session while DRM is active.
-            if drm_pause && screenpipe_engine::drm_detector::drm_content_paused() {
+            if drm_pause
+                && screenpipe_engine::drm_detector::drm_content_paused()
+                && !screenpipe_engine::drm_detector::keep_audio_during_drm()
+            {
                 if let Err(e) = audio_manager_clone.stop_output_devices().await {
                     tracing::warn!("failed to stop SCK audio after late DRM detection: {:?}", e);
                 }
