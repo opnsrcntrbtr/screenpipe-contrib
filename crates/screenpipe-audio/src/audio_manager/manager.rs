@@ -1279,6 +1279,62 @@ impl AudioManager {
         Ok(())
     }
 
+    /// Start the app-audio tap stream for `pids`.
+    ///
+    /// Mirrors `start_session_device` but without the meeting gate: an app tap
+    /// follows an application (a browser playing a lecture), not a meeting.
+    /// Every other guard is kept — capture-disabled, screen-lock, and
+    /// user-paused devices are all still honoured — and the device is
+    /// registered as session-scoped so it never lands in `enabled_devices`.
+    pub async fn start_app_tap_device(&self, device: &AudioDevice, pids: Vec<i32>) -> Result<()> {
+        if self.options.read().await.is_disabled {
+            return Err(anyhow!("audio capture is disabled"));
+        }
+        if pids.is_empty() {
+            return Err(anyhow!("app tap needs at least one pid"));
+        }
+        #[cfg(target_os = "macos")]
+        if screenpipe_config::should_pause_audio_for_lock() {
+            return Err(anyhow!("audio capture is paused while the screen is locked"));
+        }
+        if self
+            .user_disabled_devices
+            .read()
+            .await
+            .contains(&device.to_string())
+        {
+            return Err(anyhow!("device {} is paused by the user", device));
+        }
+        // Insert BEFORE starting so the audio-receiver drop-gate sees this
+        // device from the first chunk; rolled back if the start fails.
+        self.session_devices
+            .write()
+            .unwrap()
+            .insert(device.to_string());
+        if let Err(e) = self
+            .device_manager
+            .start_device_with_tap_pids(device, pids)
+            .await
+        {
+            let err_str = e.to_string();
+            if !err_str.contains("already running") {
+                self.session_devices
+                    .write()
+                    .unwrap()
+                    .remove(&device.to_string());
+                return Err(e);
+            }
+        }
+        if let Err(e) = self.ensure_recording_handle(device).await {
+            self.session_devices
+                .write()
+                .unwrap()
+                .remove(&device.to_string());
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Tear down a meeting-session stream. Never touches `enabled_devices`.
     pub async fn stop_session_device(&self, device: &AudioDevice) -> Result<()> {
         let manager = self.clone();

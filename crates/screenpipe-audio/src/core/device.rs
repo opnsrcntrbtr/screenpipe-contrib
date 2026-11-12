@@ -29,6 +29,20 @@ pub const MACOS_OUTPUT_AUDIO_DEVICE_NAME: &str = "System Audio";
 /// device lists, never persisted to enabled_devices.
 pub const MEETING_TAP_DEVICE_NAME: &str = "Meeting Tap";
 
+/// Virtual output device representing a per-application audio tap (see
+/// `audio_manager::app_tap`). Session-scoped like the Meeting Tap: started by
+/// the app-tap watcher when the configured app is running, never advertised in
+/// device lists, never persisted to enabled_devices. It exists so one app's
+/// own audio (e.g. a lecture playing in the browser) can be recorded without
+/// the microphone and without every other sound the machine makes.
+pub const APP_TAP_DEVICE_NAME: &str = "App Tap";
+
+/// True for the virtual devices whose streams are built from explicit pids
+/// rather than from a real OS endpoint.
+pub fn is_per_pid_tap_device(name: &str) -> bool {
+    name == MEETING_TAP_DEVICE_NAME || name == APP_TAP_DEVICE_NAME
+}
+
 #[derive(OaSchema, Clone, Debug)]
 pub struct DeviceControl {
     pub is_running: bool,

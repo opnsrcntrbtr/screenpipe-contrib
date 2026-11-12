@@ -219,7 +219,7 @@ impl AudioStream {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let meeting_tap_pids = tap_pids.filter(|_| {
                 device.device_type == super::device::DeviceType::Output
-                    && device.name == super::device::MEETING_TAP_DEVICE_NAME
+                    && super::device::is_per_pid_tap_device(&device.name)
             });
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let meeting_tap_pids: Option<Vec<i32>> = None;

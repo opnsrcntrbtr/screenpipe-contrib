@@ -1279,6 +1279,16 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         }
     };
 
+    // App audio tap: record one application's own audio (e.g. a lecture playing
+    // in the browser) instead of the whole system output or the microphone.
+    // Configured with SCREENPIPE_AUDIO_TAP_APPS="Google Chrome"; a no-op when
+    // unset, so upstream behaviour is unchanged by default.
+    if !config.disable_audio {
+        if screenpipe_audio::audio_manager::app_tap::spawn(audio_manager.clone()).is_none() {
+            debug!("app audio tap not configured");
+        }
+    }
+
     // Create shared pipeline metrics (used by recording + health endpoint + PostHog)
     let vision_metrics = Arc::new(screenpipe_screen::PipelineMetrics::new());
 
